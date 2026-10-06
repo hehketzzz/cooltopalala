@@ -5,47 +5,90 @@
   },
   "id": "lenya.pathfinder",
   "name": "Pathfinder",
-  "version": "v1.1.0",
+  "version": "v2.0.0",
   "developer": "Lenya",
-  "description": "Finds a path through any level and exports a Mega Hack v9 macro",
+  "description": "Finds a path through a level with the real game physics and exports a Mega Hack v9 (GDR) macro",
   "settings": {
-    "step": {
+    "search-title": { "type": "title", "name": "Search" },
+    "ticks-per-step": {
       "type": "int",
-      "name": "Decision step (frames)",
-      "description": "How often (in 60 FPS frames) the bot may change input. 1 = every frame.",
-      "default": 1,
-      "min": 1,
-      "max": 10
+      "name": "Decision step (ticks)",
+      "description": "How often the bot may change input, in physics ticks (240 per second). 4 = every 60 FPS frame, 1 = every tick (most precise, slowest).",
+      "default": 4, "min": 1, "max": 16
     },
     "budget": {
       "type": "int",
       "name": "CPU time per frame (ms)",
       "description": "How much time per real frame is spent simulating. Higher = faster search, lower FPS.",
-      "default": 14,
-      "min": 1,
-      "max": 200
+      "default": 14, "min": 1, "max": 200
     },
     "max-checkpoints": {
       "type": "int",
       "name": "Max checkpoints in memory",
       "description": "Older checkpoints are dropped and replayed from the start when needed.",
-      "default": 3000,
-      "min": 100,
-      "max": 50000
+      "default": 3000, "min": 100, "max": 50000
     },
-    "dead-end-frames": {
+    "dead-end-ticks": {
       "type": "int",
-      "name": "Dead end threshold (frames)",
-      "description": "If the bot must go back more than this many frames after dying, the spot is reported as a dead end.",
-      "default": 30,
-      "min": 3,
-      "max": 600
+      "name": "Dead end threshold (ticks)",
+      "description": "If the bot must go back more than this many ticks after dying, the spot is reported as a dead end.",
+      "default": 120, "min": 8, "max": 2400
     },
+    "smart-order": {
+      "type": "bool",
+      "name": "Smart input order",
+      "description": "Predicts the trajectory for the current gamemode before every decision and tries the input that survives longer first. Much fewer backtracks.",
+      "default": true
+    },
+    "lookahead-ticks": {
+      "type": "int",
+      "name": "Smart order lookahead (ticks)",
+      "description": "How far the prediction looks ahead when choosing which input to try first.",
+      "default": 60, "min": 8, "max": 480
+    },
+    "verify": {
+      "type": "bool",
+      "name": "Verify path",
+      "description": "Replays the found inputs from the start (exactly like a bot would) before saving the macro.",
+      "default": true
+    },
+    "draw-title": { "type": "title", "name": "Drawing" },
     "trajectory": {
       "type": "bool",
-      "name": "Draw trajectory",
+      "name": "Draw found path",
       "description": "Draw the current path (green) and deaths (red)",
       "default": true
+    },
+    "draw-prediction": {
+      "type": "bool",
+      "name": "Draw predicted trajectory",
+      "description": "Draw where the player goes if the button is held (blue) or released (orange), for the current gamemode.",
+      "default": true
+    },
+    "prediction-ticks": {
+      "type": "int",
+      "name": "Predicted trajectory length (ticks)",
+      "default": 240, "min": 10, "max": 1200
+    },
+    "prediction-in-game": {
+      "type": "bool",
+      "name": "Show trajectory while playing",
+      "description": "Also draw the predicted trajectory during normal play (not only while pathfinding).",
+      "default": false
+    },
+    "export-title": { "type": "title", "name": "Macro export" },
+    "export-dir": {
+      "type": "folder",
+      "name": "Macro folder",
+      "description": "Mega Hack v9 reads replays from the 'replays' folder next to GeometryDash.exe.",
+      "default": "{gd_dir}/replays"
+    },
+    "export-format": {
+      "type": "string",
+      "name": "Macro format",
+      "description": "gdr = GDR msgpack (Mega Hack v9 native), gdr.json = GDR JSON, both = save both files.",
+      "default": "both",
+      "one-of": ["gdr", "gdr.json", "both"]
     }
   }
 }
