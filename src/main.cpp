@@ -1,17 +1,15 @@
-// Pathfinder: brute-force path search using the game's own physics.
+// Pathfinder: brute-force path search using the game's own physics, at 60 FPS.
 //
-// How it works:
-//  * The level is restarted in practice mode and simulated at 240 TPS as fast as possible.
-//  * Every N ticks is a "decision point": the bot saves a checkpoint and first tries to keep
-//    the current input (held / released). If the player dies, it loads the checkpoint and tries
-//    the opposite input. If both fail, it goes further back (depth-first search with backtracking).
-//  * Because the real game physics is used, every gamemode, orb, pad, portal and trigger
-//    works automatically - the bot doesn't need to "understand" them.
-//  * States that were proven deadly are remembered (hash of player state), so the search
-//    doesn't retry identical situations.
-//  * If after dying the bot has to go back far (more than "dead end threshold"), that place is
-//    reported as a dead end: you could reach it alive, but there was no way to survive from there.
-//  * When the level is completed, inputs are saved as a GDR (.gdr.json) macro for Mega Hack v9.
+//  * Pressing "Start pathfind" restarts the level (practice mode) and simulates it frame by
+//    frame (1/60 s per frame = 4 physics ticks), as fast as possible.
+//  * Every frame is a decision point: the bot saves a checkpoint, first keeps the current input,
+//    and if the player dies it loads the checkpoint and tries the opposite input. If both fail it
+//    goes further back (depth-first search with backtracking).
+//  * Real game physics is used, so all gamemodes, orbs, pads, portals and triggers just work.
+//  * Player states proven deadly are remembered (hashed) so they are not retried.
+//  * Going back further than the "dead end threshold" after a death marks that spot as a dead end.
+//  * The found path is exported as a 60 FPS GDR (.gdr.json) macro for Mega Hack v9.
+//  * The current path is drawn green, deaths are drawn as red dots.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -24,13 +22,15 @@
 
 using namespace geode::prelude;
 
+static constexpr float FPS = 60.f;
+
 struct InputEvent {
     int frame;
     bool down;
 };
 
 struct Node {
-    int tick;
+    int frame;
     CheckpointObject* cp;
     uint64_t hash;
     bool prevHeld;
@@ -46,15 +46,17 @@ struct PFState {
     bool completed = false;
     bool botInput = false;
     bool held = false;
+    int frame = 0;
 
     bool replaying = false;
     int replayTarget = 0;
     size_t replayPos = 0;
 
-    int step = 4;
+    int step = 1;
     int budgetMs = 14;
     size_t maxCheckpoints = 3000;
-    int deadEndTicks = 120;
+    int deadEndFrames = 30;
+    bool drawTrajectory = true;
 
     std::vector<Node> stack;
     size_t firstLive = 0;
@@ -63,6 +65,10 @@ struct PFState {
     std::vector<float> deadEnds;
     float bestPercent = 0.f;
     int backtracks = 0;
+
+    std::vector<CCPoint> path;    // player position per frame (object layer space)
+    std::vector<CCPoint> deaths;  // recent death positions
+    CCDrawNode* drawNode = nullptr;
     CCLabelBMFont* label = nullptr;
 };
 
@@ -97,13 +103,9 @@ static uint64_t hashPlayer(uint64_t h, PlayerObject* p) {
     return mix(h, flags);
 }
 
-static int currentTick(PlayLayer* pl) {
-    return pl->m_gameState.m_currentProgress;
-}
-
 static uint64_t stateHash(PlayLayer* pl) {
     uint64_t h = 1469598103934665603ULL;
-    h = mix(h, uint64_t(currentTick(pl)));
+    h = mix(h, uint64_t(g_pf.frame));
     h = mix(h, uint64_t(g_pf.held));
     h = hashPlayer(h, pl->m_player1);
     h = hashPlayer(h, pl->m_player2);
@@ -114,6 +116,18 @@ static void rawButton(PlayLayer* pl, bool down) {
     g_pf.botInput = true;
     pl->handleButton(down, 1, true);
     g_pf.botInput = false;
+}
+
+static CCPoint playerPos(PlayLayer* pl) {
+    auto p = pl->m_player1;
+    if (!p || !p->getParent() || !pl->m_objectLayer) return {0.f, 0.f};
+    auto world = p->getParent()->convertToWorldSpace(p->getPosition());
+    return pl->m_objectLayer->convertToNodeSpace(world);
+}
+
+static void recordPosition(PlayLayer* pl) {
+    if (static_cast<int>(g_pf.path.size()) > g_pf.frame) g_pf.path.resize(g_pf.frame);
+    g_pf.path.push_back(playerPos(pl));
 }
 
 static std::string jsonEscape(std::string const& s) {
@@ -174,18 +188,45 @@ static void releaseAllCheckpoints() {
     g_pf.firstLive = 0;
 }
 
-// ---------------- macro export ----------------
+// ---------------- trajectory ----------------
+
+static void ensureDrawNode(PlayLayer* pl) {
+    if (g_pf.drawNode || !pl->m_objectLayer) return;
+    g_pf.drawNode = CCDrawNode::create();
+    pl->m_objectLayer->addChild(g_pf.drawNode, 9999);
+}
+
+static void drawTrajectory() {
+    if (!g_pf.drawNode) return;
+    g_pf.drawNode->clear();
+    if (!g_pf.drawTrajectory) return;
+
+    ccColor4F green = {0.f, 1.f, 0.3f, 1.f};
+    ccColor4F red = {1.f, 0.1f, 0.1f, 0.8f};
+
+    for (size_t i = 1; i < g_pf.path.size(); i++) {
+        auto& a = g_pf.path[i - 1];
+        auto& b = g_pf.path[i];
+        if (std::abs(a.x - b.x) > 300.f || std::abs(a.y - b.y) > 300.f) continue; // teleports
+        g_pf.drawNode->drawSegment(a, b, 1.2f, green);
+    }
+    for (auto& d : g_pf.deaths) {
+        g_pf.drawNode->drawDot(d, 2.5f, red);
+    }
+}
+
+// ---------------- macro export (GDR, 60 FPS) ----------------
 
 static std::string saveMacro(PlayLayer* pl) {
     std::string name = pl->m_level ? std::string(pl->m_level->m_levelName) : "level";
     int levelID = pl->m_level ? pl->m_level->m_levelID.value() : 0;
-    float duration = g_pf.inputs.empty() ? 0.f : g_pf.inputs.back().frame / 240.f;
+    float duration = g_pf.frame / FPS;
 
     std::string j = "{";
     j += fmt::format("\"gameVersion\":2.2081,\"description\":\"Generated by Pathfinder\",\"version\":1.0,\"duration\":{:.3f},", duration);
-    j += "\"bot\":{\"name\":\"Pathfinder\",\"version\":\"1.0.0\"},";
+    j += "\"bot\":{\"name\":\"Pathfinder\",\"version\":\"1.1.0\"},";
     j += fmt::format("\"level\":{{\"id\":{},\"name\":\"{}\"}},", levelID, jsonEscape(name));
-    j += "\"author\":\"Pathfinder\",\"seed\":0,\"coins\":0,\"ldm\":false,\"framerate\":240.0,\"inputs\":[";
+    j += "\"author\":\"Pathfinder\",\"seed\":0,\"coins\":0,\"ldm\":false,\"framerate\":60.0,\"inputs\":[";
     for (size_t i = 0; i < g_pf.inputs.size(); i++) {
         auto& e = g_pf.inputs[i];
         j += fmt::format("{}{{\"frame\":{},\"btn\":1,\"2p\":false,\"down\":{}}}",
@@ -195,11 +236,11 @@ static std::string saveMacro(PlayLayer* pl) {
 
     auto fileName = safeFileName(name) + "_pathfinder.gdr.json";
     auto path = Mod::get()->getSaveDir() / fileName;
-    std::ofstream f(path, std::ios::binary);
-    f << j;
-    f.close();
+    {
+        std::ofstream f(path, std::ios::binary);
+        f << j;
+    }
 
-    // Also try to drop it straight into Mega Hack's replay folder if it exists
     auto mhDir = dirs::getModsSaveDir() / "absolllute.megahack" / "replays";
     std::error_code ec;
     if (std::filesystem::exists(mhDir, ec)) {
@@ -210,6 +251,13 @@ static std::string saveMacro(PlayLayer* pl) {
 }
 
 // ---------------- search ----------------
+
+static void resetToStart(PlayLayer* pl) {
+    pl->resetLevel();
+    rawButton(pl, false);
+    g_pf.held = false;
+    g_pf.frame = 0;
+}
 
 static void finish(PlayLayer* pl, bool success, std::string const& reason = "") {
     g_pf.running = false;
@@ -224,7 +272,7 @@ static void finish(PlayLayer* pl, bool success, std::string const& reason = "") 
     if (success) {
         auto path = saveMacro(pl);
         text = fmt::format(
-            "Path found!\nInputs: {}, backtracks: {}\nDead ends: {}\n\nMacro saved to:\n{}",
+            "Path found! (60 FPS macro)\nInputs: {}, backtracks: {}\nDead ends: {}\n\nMacro saved to:\n{}",
             g_pf.inputs.size(), g_pf.backtracks, formatDeadEnds(), path);
     } else {
         text = fmt::format(
@@ -232,10 +280,12 @@ static void finish(PlayLayer* pl, bool success, std::string const& reason = "") 
             reason.empty() ? "No path found - the level looks impossible with these settings." : reason,
             g_pf.bestPercent, g_pf.backtracks, formatDeadEnds());
     }
+    log::info("Pathfinder finished: {}", text);
 
     rawButton(pl, false);
     if (pl->m_isPracticeMode) pl->togglePracticeMode(false);
     pl->resetLevel();
+    drawTrajectory(); // keep the final path visible
 
     Loader::get()->queueInMainThread([text] {
         FLAlertLayer::create("Pathfinder", text, "OK")->show();
@@ -243,18 +293,20 @@ static void finish(PlayLayer* pl, bool success, std::string const& reason = "") 
 }
 
 static void applyAlternative(PlayLayer* pl, Node& n) {
-    // normalize button state, then apply the opposite of what was tried first
     rawButton(pl, false);
     bool want = !n.prevHeld;
     if (want) rawButton(pl, true);
     g_pf.held = want;
-    g_pf.inputs.push_back({n.tick, want});
+    g_pf.inputs.push_back({n.frame, want});
 }
 
 static void backtrack(PlayLayer* pl) {
     g_pf.backtracks++;
-    int deathTick = currentTick(pl);
+    int deathFrame = g_pf.frame;
     float deathPercent = pl->getCurrentPercent();
+
+    g_pf.deaths.push_back(playerPos(pl));
+    if (g_pf.deaths.size() > 400) g_pf.deaths.erase(g_pf.deaths.begin());
 
     while (!g_pf.stack.empty() && g_pf.stack.back().tried >= 1) {
         auto& b = g_pf.stack.back();
@@ -271,21 +323,21 @@ static void backtrack(PlayLayer* pl) {
 
     auto& n = g_pf.stack.back();
     n.tried = 1;
-    if (deathTick - n.tick > g_pf.deadEndTicks) addDeadEnd(deathPercent);
+    if (deathFrame - n.frame > g_pf.deadEndFrames) addDeadEnd(deathPercent);
 
     g_pf.inputs.resize(n.inputsSize);
+    if (static_cast<int>(g_pf.path.size()) > n.frame + 1) g_pf.path.resize(n.frame + 1);
 
     if (n.cp) {
         pl->loadFromCheckpoint(n.cp);
+        g_pf.frame = n.frame;
         applyAlternative(pl, n);
     } else {
         // checkpoint was dropped to save memory: replay from the start up to this node
         g_pf.replaying = true;
-        g_pf.replayTarget = n.tick;
+        g_pf.replayTarget = n.frame;
         g_pf.replayPos = 0;
-        pl->resetLevel();
-        rawButton(pl, false);
-        g_pf.held = false;
+        resetToStart(pl);
     }
 }
 
@@ -296,8 +348,9 @@ static void pushNode(PlayLayer* pl) {
         return;
     }
 
-    Node n{currentTick(pl), pl->createCheckpoint(), h, g_pf.held, 0, g_pf.inputs.size()};
+    Node n{g_pf.frame, pl->createCheckpoint(), h, g_pf.held, 0, g_pf.inputs.size()};
     if (n.cp) n.cp->retain();
+    else log::warn("Pathfinder: createCheckpoint returned null at frame {}", g_pf.frame);
     g_pf.stack.push_back(n);
 
     while (g_pf.stack.size() - g_pf.firstLive > g_pf.maxCheckpoints) {
@@ -309,10 +362,13 @@ static void pushNode(PlayLayer* pl) {
 }
 
 static void startSearch(PlayLayer* pl) {
+    log::info("Pathfinder: starting");
     releaseAllCheckpoints();
     g_pf.inputs.clear();
     g_pf.dead.clear();
     g_pf.deadEnds.clear();
+    g_pf.path.clear();
+    g_pf.deaths.clear();
     g_pf.bestPercent = 0.f;
     g_pf.backtracks = 0;
     g_pf.died = false;
@@ -323,12 +379,14 @@ static void startSearch(PlayLayer* pl) {
     g_pf.step = static_cast<int>(Mod::get()->getSettingValue<int64_t>("step"));
     g_pf.budgetMs = static_cast<int>(Mod::get()->getSettingValue<int64_t>("budget"));
     g_pf.maxCheckpoints = static_cast<size_t>(Mod::get()->getSettingValue<int64_t>("max-checkpoints"));
-    g_pf.deadEndTicks = static_cast<int>(Mod::get()->getSettingValue<int64_t>("dead-end-ticks"));
+    g_pf.deadEndFrames = static_cast<int>(Mod::get()->getSettingValue<int64_t>("dead-end-frames"));
+    g_pf.drawTrajectory = Mod::get()->getSettingValue<bool>("trajectory");
 
+    // restart the level from scratch
     if (!pl->m_isPracticeMode) pl->togglePracticeMode(true);
-    pl->resetLevel();
-    rawButton(pl, false);
-    g_pf.held = false;
+    resetToStart(pl);
+
+    ensureDrawNode(pl);
 
     if (!g_pf.label) {
         auto win = CCDirector::get()->getWinSize();
@@ -339,6 +397,7 @@ static void startSearch(PlayLayer* pl) {
         pl->addChild(g_pf.label, 10000);
     }
 
+    recordPosition(pl);
     pushNode(pl);
 }
 
@@ -347,8 +406,8 @@ static void updateLabel(PlayLayer* pl) {
     float pct = pl->getCurrentPercent();
     if (pct > g_pf.bestPercent) g_pf.bestPercent = pct;
     g_pf.label->setString(fmt::format(
-        "Pathfinding{}: {:.1f}% (best {:.1f}%)\nBacktracks: {}  Dead ends: {}",
-        g_pf.replaying ? " (replaying)" : "", pct, g_pf.bestPercent,
+        "Pathfinding{}: {:.1f}% (best {:.1f}%)\nFrame {}  Backtracks: {}  Dead ends: {}",
+        g_pf.replaying ? " (replaying)" : "", pct, g_pf.bestPercent, g_pf.frame,
         g_pf.backtracks, g_pf.deadEnds.size()).c_str());
 }
 
@@ -356,8 +415,7 @@ static void updateLabel(PlayLayer* pl) {
 
 class $modify(PFGameLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
-        // block the real player's input while the bot is searching
-        if (g_pf.running && !g_pf.botInput) return;
+        if (g_pf.running && !g_pf.botInput) return; // block real input during the search
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 
@@ -385,7 +443,7 @@ class $modify(PFGameLayer, GJBaseGameLayer) {
 
             if (g_pf.replaying) {
                 while (g_pf.replayPos < g_pf.inputs.size() &&
-                       g_pf.inputs[g_pf.replayPos].frame <= currentTick(pl)) {
+                       g_pf.inputs[g_pf.replayPos].frame <= g_pf.frame) {
                     bool d = g_pf.inputs[g_pf.replayPos].down;
                     rawButton(pl, d);
                     g_pf.held = d;
@@ -393,11 +451,14 @@ class $modify(PFGameLayer, GJBaseGameLayer) {
                 }
             }
 
+            // one 60 FPS frame = 4 physics ticks
             g_pf.died = false;
-            GJBaseGameLayer::update(1.f / 240.f);
+            GJBaseGameLayer::update(1.f / FPS);
+            g_pf.frame++;
             if (!g_pf.running) break;
 
-            if (g_pf.completed) {
+            if (g_pf.completed || pl->getCurrentPercent() >= 100.f) {
+                recordPosition(pl);
                 finish(pl, true);
                 break;
             }
@@ -407,7 +468,7 @@ class $modify(PFGameLayer, GJBaseGameLayer) {
                     finish(pl, false, "Replay desync (the level is not deterministic).");
                     break;
                 }
-                if (currentTick(pl) >= g_pf.replayTarget) {
+                if (g_pf.frame >= g_pf.replayTarget) {
                     g_pf.replaying = false;
                     auto& n = g_pf.stack.back();
                     n.cp = pl->createCheckpoint();
@@ -423,12 +484,17 @@ class $modify(PFGameLayer, GJBaseGameLayer) {
                 continue;
             }
 
-            if (!g_pf.stack.empty() && currentTick(pl) >= g_pf.stack.back().tick + g_pf.step) {
+            recordPosition(pl);
+
+            if (!g_pf.stack.empty() && g_pf.frame >= g_pf.stack.back().frame + g_pf.step) {
                 pushNode(pl);
             }
         }
 
-        if (g_pf.running) updateLabel(pl);
+        if (g_pf.running) {
+            updateLabel(pl);
+            drawTrajectory();
+        }
     }
 };
 
@@ -450,13 +516,14 @@ class $modify(PFPlayLayer, PlayLayer) {
     }
 
     void onQuit() {
-        if (g_pf.running || g_pf.needsStart) {
-            g_pf.running = false;
-            g_pf.needsStart = false;
-            g_pf.replaying = false;
-            releaseAllCheckpoints();
-            g_pf.label = nullptr; // destroyed together with the layer
-        }
+        g_pf.running = false;
+        g_pf.needsStart = false;
+        g_pf.replaying = false;
+        releaseAllCheckpoints();
+        g_pf.label = nullptr;    // destroyed together with the layer
+        g_pf.drawNode = nullptr; // same
+        g_pf.path.clear();
+        g_pf.deaths.clear();
         PlayLayer::onQuit();
     }
 };
@@ -497,10 +564,9 @@ class $modify(PFPauseLayer, PauseLayer) {
 
         createQuickPopup(
             "Pathfinder",
-            "Finds a path through the level by trying inputs with the real game physics "
-            "(all gamemodes, orbs and pads work), reports dead ends and saves a "
-            "<cy>Mega Hack v9</c> macro (.gdr.json).\n\n"
-            "The level restarts in <cg>practice mode</c> while searching. "
+            "Restarts the level and finds a path by trying inputs with the real game physics "
+            "(all gamemodes, orbs and pads work). Draws the trajectory, reports dead ends and saves a "
+            "<cy>60 FPS Mega Hack v9</c> macro (.gdr.json).\n\n"
             "Open this menu again to stop.",
             "Cancel", "Start pathfind",
             [this](FLAlertLayer*, bool btn2) {

@@ -1,15 +1,51 @@
 {
   "geode": "5.10.1",
-  "gd": { "win": "2.2081" },
+  "gd": {
+    "win": "2.2081"
+  },
   "id": "lenya.pathfinder",
   "name": "Pathfinder",
-  "version": "v1.0.0",
+  "version": "v1.1.0",
   "developer": "Lenya",
   "description": "Finds a path through any level and exports a Mega Hack v9 macro",
   "settings": {
-    "step": { "type": "int", "name": "Decision step (ticks)", "description": "How often (in 240 TPS ticks) the bot may change input. Lower = more precise but slower.", "default": 4, "min": 1, "max": 20 },
-    "budget": { "type": "int", "name": "CPU time per frame (ms)", "description": "How much time per frame is spent simulating. Higher = faster search, lower FPS.", "default": 14, "min": 1, "max": 200 },
-    "max-checkpoints": { "type": "int", "name": "Max checkpoints in memory", "description": "Older checkpoints are dropped and replayed from the start when needed.", "default": 3000, "min": 100, "max": 50000 },
-    "dead-end-ticks": { "type": "int", "name": "Dead end threshold (ticks)", "description": "If the bot must go back more than this many ticks after dying, the spot is reported as a dead end.", "default": 120, "min": 10, "max": 2400 }
+    "step": {
+      "type": "int",
+      "name": "Decision step (frames)",
+      "description": "How often (in 60 FPS frames) the bot may change input. 1 = every frame.",
+      "default": 1,
+      "min": 1,
+      "max": 10
+    },
+    "budget": {
+      "type": "int",
+      "name": "CPU time per frame (ms)",
+      "description": "How much time per real frame is spent simulating. Higher = faster search, lower FPS.",
+      "default": 14,
+      "min": 1,
+      "max": 200
+    },
+    "max-checkpoints": {
+      "type": "int",
+      "name": "Max checkpoints in memory",
+      "description": "Older checkpoints are dropped and replayed from the start when needed.",
+      "default": 3000,
+      "min": 100,
+      "max": 50000
+    },
+    "dead-end-frames": {
+      "type": "int",
+      "name": "Dead end threshold (frames)",
+      "description": "If the bot must go back more than this many frames after dying, the spot is reported as a dead end.",
+      "default": 30,
+      "min": 3,
+      "max": 600
+    },
+    "trajectory": {
+      "type": "bool",
+      "name": "Draw trajectory",
+      "description": "Draw the current path (green) and deaths (red)",
+      "default": true
+    }
   }
 }
